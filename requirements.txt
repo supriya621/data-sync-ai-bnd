@@ -1,0 +1,26 @@
+# Flask Framework
+Flask==2.3.3
+Flask-CORS==4.0.0
+Flask-Session==0.5.0
+Werkzeug==2.3.7
+gunicorn==21.2.0
+
+# Configuration and Environment
+python-dotenv==1.0.0
+
+# Data Processing
+pandas==2.1.1
+openpyxl==3.1.2
+
+# Authentication
+bcrypt==4.0.1
+
+# Microsoft Fabric / Azure Integration
+pyodbc==4.0.39
+azure-identity==1.15.0
+
+# DuckDB for Large File Processing  
+duckdb==0.9.1
+
+# Logging and Utilities
+logging==0.4.9.6
