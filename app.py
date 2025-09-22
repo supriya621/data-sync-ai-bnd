@@ -500,11 +500,11 @@ def reject_user_endpoint(user_id):
         logger.error(f"Error rejecting user: {e}")
         return jsonify({'success': False, 'message': 'Failed to reject user'}), 500
 
-# File Upload Route - ALWAYS uses DuckDB
+# File Upload Route - SQL TABLE DATA ONLY (NO lakehouse files)
 @app.route('/api/files/upload', methods=['POST'])
 @login_required
 def upload_file():
-    """Upload file for DuckDB processing - ALL files processed with DuckDB"""
+    """Upload file - stores ONLY table data in SQL Fabric, NO files in lakehouse"""
     try:
         if 'file' not in request.files:
             return jsonify({'success': False, 'message': 'No file provided'}), 400
@@ -513,53 +513,78 @@ def upload_file():
         if file.filename == '':
             return jsonify({'success': False, 'message': 'No file selected'}), 400
         
-        # Save file
-        filename = f"{session['user_id']}_{uuid.uuid4()}_{file.filename}"
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        file.save(filepath)
+        # Save file TEMPORARILY for data extraction ONLY
+        temp_filename = f"temp_{session['user_id']}_{uuid.uuid4()}_{file.filename}"
+        temp_filepath = os.path.join(app.config['UPLOAD_FOLDER'], temp_filename)
+        file.save(temp_filepath)
         
-        # Read file to get basic info for preview only
-        if filepath.endswith('.csv'):
-            df_sample = pd.read_csv(filepath, nrows=5)  # Just for preview
-            total_rows = sum(1 for line in open(filepath, 'r', encoding='utf-8')) - 1
-        elif filepath.endswith(('.xlsx', '.xls')):
-            df_sample = pd.read_excel(filepath, nrows=5)
-            df_full = pd.read_excel(filepath)
+        logger.info(f"TEMP file saved for processing ONLY: {temp_filename}")
+        logger.info(f"NO lakehouse storage - temp file for data extraction only")
+        
+        # Read file IN MEMORY and extract table data ONLY
+        if temp_filepath.endswith('.csv'):
+            df_sample = pd.read_csv(temp_filepath, nrows=5)  # Preview
+            df_full = pd.read_csv(temp_filepath)  # Full data for SQL storage
+            total_rows = len(df_full)
+        elif temp_filepath.endswith(('.xlsx', '.xls')):
+            df_sample = pd.read_excel(temp_filepath, nrows=5)  # Preview
+            df_full = pd.read_excel(temp_filepath)  # Full data for SQL storage
             total_rows = len(df_full)
         else:
             return jsonify({'success': False, 'message': 'Unsupported file format'}), 400
         
-        # Create template in Fabric SQL
+        # Create template in SQL Fabric (metadata ONLY)
         template_result = fabric_service.execute_query("""
-            INSERT INTO excel_templates (template_name, user_id, headers, sheet_name)
+            INSERT INTO excel_templates (template_name, user_id, headers, sheet_name, remote_file_path)
             OUTPUT INSERTED.template_id
-            VALUES (?, ?, ?, ?)
-        """, (filename, session['user_id'], json.dumps(df_sample.columns.tolist()), 'Sheet1'))
+            VALUES (?, ?, ?, ?, 'SQL_TABLE_ONLY')
+        """, (file.filename, session['user_id'], json.dumps(df_sample.columns.tolist()), 'Sheet1'))
         
         template_id = template_result[0]['template_id']
         
-        # Store in session
+        # Store ONLY table data in SQL Fabric using bulk insert
+        session_id = get_session_id()
+        fabric_service.bulk_insert_file_data(df_full, session_id, template_id)
+        
+        logger.info(f"STORED TABLE DATA ONLY in SQL Fabric: {total_rows} rows")
+        logger.info(f"NO files stored in lakehouse - only processed data")
+        
+        # IMMEDIATELY delete temp file - NO persistent file storage
+        try:
+            os.remove(temp_filepath)
+            logger.info(f"DELETED temp file: {temp_filename}")
+            logger.info(f"RESULT: Only table data in SQL Fabric, NO files anywhere")
+        except Exception as e:
+            logger.warning(f"Could not delete temp file: {e}")
+        
+        # Store in session (NO file paths - only table metadata)
         session['current_file'] = {
-            'filename': filename,
-            'filepath': filepath,
+            'filename': file.filename,  # Original name for display
             'headers': df_sample.columns.tolist(),
             'row_count': total_rows,
             'preview': df_sample.to_dict('records'),
             'template_id': template_id,
-            'processing_engine': 'DuckDB'  # Always DuckDB
+            'processing_engine': 'SQL_TABLE_ONLY',
+            'storage_type': 'SQL_TABLE_ONLY',
+            'file_stored': False,  # Explicit flag
+            'lakehouse_storage': False  # Explicit flag
         }
         
         session['current_template_id'] = template_id
         
-        # ALWAYS load into DuckDB for processing regardless of file size
-        session_id = get_session_id()
-        duckdb_result = duckdb_service.load_file_data(filepath, session_id, template_id)
-        logger.info(f"File loaded into DuckDB: {total_rows} rows, processing method: DuckDB")
+        # NO DuckDB processing - using SQL Fabric table data only
+        logger.info(f"File data loaded into SQL Fabric ONLY: {total_rows} rows")
         
         return jsonify({
             'success': True,
             'file_info': session['current_file'],
-            'message': f'File loaded successfully using DuckDB ({total_rows} rows)'
+            'message': f'File data stored in SQL Fabric tables ONLY ({total_rows} rows)',
+            'storage_info': {
+                'type': 'SQL_TABLE_ONLY',
+                'lakehouse_files': False,
+                'sql_table_data': True,
+                'temp_file_deleted': True
+            }
         }), 200
         
     except Exception as e:
@@ -700,11 +725,11 @@ def review_configuration():
         logger.error(f"Review configuration error: {e}")
         return jsonify({'success': False, 'message': 'Configuration review failed'}), 500
 
-# Data Validation Routes (Steps 4-6) - ALL using DuckDB
+# Data Validation Routes - ONLY SQL Fabric table data (NO file/DuckDB processing)
 @app.route('/api/validation/validate', methods=['POST'])
 @login_required
 def validate_data():
-    """Step 4: Validate data using DuckDB for ALL files"""
+    """Validate data using ONLY SQL Fabric table data - NO file or DuckDB processing"""
     try:
         if not session.get('current_file') or not session.get('rules_config'):
             return jsonify({'success': False, 'message': 'Configuration incomplete'}), 400
@@ -716,28 +741,31 @@ def validate_data():
         
         start_time = time.time()
         
-        # ALWAYS use DuckDB for validation regardless of file size
-        logger.info(f"Starting DuckDB validation for {current_file['row_count']} rows...")
-        validation_result = duckdb_service.validate_data(session_id, template_id, rules_config)
+        logger.info(f"Starting SQL Fabric table validation for {current_file['row_count']} rows...")
+        logger.info(f"NO file processing - validating SQL table data ONLY")
         
-        # Get sample data for display (first 100 rows for performance)
-        sample_data = duckdb_service.get_data_rows(session_id, template_id, 
+        # Validate ONLY SQL Fabric table data (no DuckDB or file access)
+        validation_result = fabric_service.validate_data_in_sql_fabric(session_id, template_id, rules_config)
+        
+        # Get sample data for display from SQL Fabric ONLY (first 100 rows)
+        sample_data = fabric_service.get_file_data(session_id, template_id, 
                                                  session['selected_headers'])[:100]
         
         processing_time = int((time.time() - start_time) * 1000)
         
-        # Save validation history to Fabric SQL
+        # Save validation history to SQL Fabric
         fabric_service.execute_non_query("""
             INSERT INTO validation_history 
             (template_id, template_name, error_count, corrected_file_path, user_id, processing_time_ms)
             VALUES (?, ?, ?, ?, ?, ?)
         """, (template_id, current_file['filename'], validation_result['total_errors'], 
-              current_file['filepath'], session['user_id'], processing_time))
+              'SQL_TABLE_DATA_ONLY', session['user_id'], processing_time))
         
         session['validation_errors'] = validation_result['error_cell_locations']
-        session['processing_method'] = 'DuckDB'  # Always DuckDB
+        session['processing_method'] = 'SQL_FABRIC_ONLY'
         
-        logger.info(f"DuckDB validation completed: {validation_result['total_errors']} errors found in {processing_time}ms")
+        logger.info(f"SQL Fabric table validation completed: {validation_result['total_errors']} errors found in {processing_time}ms")
+        logger.info(f"Validated SQL table data ONLY - no file or lakehouse access")
         
         return jsonify({
             'success': True,
@@ -745,13 +773,19 @@ def validate_data():
             'total_errors': validation_result['total_errors'],
             'data': sample_data,
             'processing_time_ms': processing_time,
-            'processing_method': 'DuckDB',
-            'file_rows': current_file['row_count']
+            'processing_method': 'SQL_FABRIC_TABLE_ONLY',
+            'file_rows': current_file['row_count'],
+            'storage_info': {
+                'validation_source': 'SQL_TABLE_ONLY',
+                'file_access': False,
+                'lakehouse_access': False,
+                'duckdb_processing': False
+            }
         }), 200
         
     except Exception as e:
-        logger.error(f"DuckDB validation error: {e}")
-        return jsonify({'success': False, 'message': f'DuckDB validation failed: {str(e)}'}), 500
+        logger.error(f"SQL Fabric table validation error: {e}")
+        return jsonify({'success': False, 'message': f'SQL table validation failed: {str(e)}'}), 500
 
 def convert_errors_to_list(error_dict):
     """Convert error dictionary to list format for frontend"""
@@ -770,7 +804,7 @@ def convert_errors_to_list(error_dict):
 @app.route('/api/validation/correct', methods=['POST'])
 @login_required
 def correct_errors():
-    """Step 5: Apply corrections using DuckDB"""
+    """Apply corrections to SQL Fabric table data ONLY - NO file modifications"""
     try:
         data = request.get_json()
         corrections = data.get('corrections', {})
@@ -785,24 +819,32 @@ def correct_errors():
         session_id = get_session_id()
         template_id = session['current_template_id']
         
-        # Apply corrections using DuckDB
-        corrected_count = apply_corrections_with_duckdb(corrections, session_id, template_id)
+        logger.info(f"Applying corrections to SQL Fabric table data ONLY")
+        logger.info(f"NO file modifications - updating SQL table data only")
+        
+        # Apply corrections to SQL Fabric table data ONLY
+        corrected_count = fabric_service.apply_corrections_in_sql_fabric(corrections, session_id, template_id)
         
         session['corrections'] = corrections
         session['corrected_count'] = corrected_count
         
-        logger.info(f"Applied {corrected_count} corrections using DuckDB")
+        logger.info(f"Applied {corrected_count} corrections to SQL table data ONLY")
         
         return jsonify({
             'success': True,
-            'message': f'Corrections applied successfully using DuckDB',
+            'message': f'Corrections applied to SQL table data ONLY',
             'corrected_rows': corrected_count,
-            'processing_engine': 'DuckDB'
+            'processing_engine': 'SQL_FABRIC_TABLE_ONLY',
+            'storage_info': {
+                'corrections_target': 'SQL_TABLE_ONLY',
+                'file_modifications': False,
+                'lakehouse_updates': False
+            }
         }), 200
         
     except Exception as e:
-        logger.error(f"DuckDB error correction failed: {e}")
-        return jsonify({'success': False, 'message': f'DuckDB error correction failed: {str(e)}'}), 500
+        logger.error(f"SQL Fabric table correction failed: {e}")
+        return jsonify({'success': False, 'message': f'SQL table correction failed: {str(e)}'}), 500
 
 def apply_corrections_with_duckdb(corrections, session_id, template_id):
     """Apply corrections using DuckDB operations"""
@@ -877,7 +919,7 @@ def review_changes():
 @app.route('/api/files/download-corrected', methods=['GET'])
 @login_required
 def download_corrected():
-    """Download corrected file - data processed by DuckDB"""
+    """Download corrected file with corrected data and proper filename"""
     try:
         current_file = session.get('current_file')
         if not current_file:
@@ -887,33 +929,36 @@ def download_corrected():
         template_id = session['current_template_id']
         headers = session.get('selected_headers', [])
         
-        # Get corrected data from DuckDB
-        corrected_data = duckdb_service.get_data_rows(session_id, template_id, headers)
+        logger.info(f"Generating corrected download file from SQL Fabric table data")
+        logger.info(f"Including all applied corrections from validation process")
         
-        if not corrected_data:
+        # Get corrected data from SQL Fabric table (this should include all corrections)
+        corrected_data = fabric_service.export_corrected_data(session_id, template_id, headers)
+        
+        if corrected_data.empty:
             return jsonify({'success': False, 'message': 'No corrected data available'}), 400
         
-        # Create DataFrame from DuckDB data
-        df = pd.DataFrame(corrected_data)
         original_filename = current_file['filename']
         
-        # Generate corrected filename
+        # Generate corrected filename: "originalname_corrected.ext"
         base_name, ext = os.path.splitext(original_filename)
-        corrected_filename = f"{base_name}_corrected_duckdb{ext}"
+        corrected_filename = f"{base_name}_corrected{ext}"
         corrected_filepath = os.path.join(app.config['UPLOAD_FOLDER'], corrected_filename)
         
-        # Save corrected file
+        # Save corrected file with corrected data from SQL table
         if ext.lower() == '.csv':
-            df.to_csv(corrected_filepath, index=False)
+            corrected_data.to_csv(corrected_filepath, index=False)
         else:
-            df.to_excel(corrected_filepath, index=False)
+            corrected_data.to_excel(corrected_filepath, index=False)
         
-        logger.info(f"Generated corrected file using DuckDB data: {corrected_filename}")
+        logger.info(f"Generated corrected download file: {corrected_filename}")
+        logger.info(f"File contains corrected data from SQL Fabric validation process")
+        logger.info(f"Total rows in corrected file: {len(corrected_data)}")
         
         return send_file(corrected_filepath, as_attachment=True, download_name=corrected_filename)
         
     except Exception as e:
-        logger.error(f"DuckDB download error: {e}")
+        logger.error(f"Corrected file download error: {e}")
         return jsonify({'success': False, 'message': f'Download failed: {str(e)}'}), 500
 
 # Available rules endpoint

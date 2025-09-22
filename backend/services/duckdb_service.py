@@ -506,8 +506,17 @@ class DuckDBService:
             data_to_insert = []
             for row_idx, (_, row) in enumerate(data_rows.iterrows()):
                 for col_name in headers:
-                    value = str(row[col_name]) if pd.notna(row[col_name]) else 'NULL'
-                    data_to_insert.append((session_id, template_id, row_idx, col_name, value))
+                    # FIX: Safely access column data
+                    try:
+                        if col_name in data_rows.columns:
+                            value = str(row[col_name]) if pd.notna(row[col_name]) else 'NULL'
+                        else:
+                            value = 'NULL'
+                    except (KeyError, IndexError) as e:
+                        self.logger.warning(f"Column access error for '{col_name}': {e}")
+                        value = 'NULL'
+                    
+                    data_to_insert.append((session_id, template_id, row_idx, str(col_name), value))
             
             # Batch insert all data
             conn.executemany("""

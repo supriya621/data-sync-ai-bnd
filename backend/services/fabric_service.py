@@ -45,6 +45,7 @@ class FabricSQLService:
                     f"Authentication=ActiveDirectoryServicePrincipal;"
                     f"Encrypt=yes;"
                     f"TrustServerCertificate=no;"
+                    f"LoginTimeout=120;"
                 )
                 
                 self.logger.info("Connecting to Fabric SQL with Service Principal authentication...")
@@ -150,7 +151,7 @@ class FabricSQLService:
                         headers NVARCHAR(MAX),
                         status NVARCHAR(20) DEFAULT 'ACTIVE',
                         is_corrected BIT DEFAULT 0,
-                        remote_file_path NVARCHAR(512),
+                        remote_file_path NVARCHAR(512) DEFAULT 'SQL_TABLE_ONLY',
                         validation_frequency NVARCHAR(20),
                         first_identified_at DATETIME2,
                         FOREIGN KEY (user_id) REFERENCES login_details(id)
@@ -261,55 +262,181 @@ class FabricSQLService:
             return None
     
     def bulk_insert_file_data(self, dataframe, session_id: str, template_id: int):
-        """Bulk insert file data into SQL Fabric for processing"""
+        """ULTRA-FAST bulk insert - Target: <15 seconds for 25K rows"""
+        import time
+        start_time = time.time()
+        
         try:
             conn = self.get_connection()
             cursor = conn.cursor()
             
-            # Create a temporary table for this session's data
+            # Create table name
             table_name = f"file_data_{session_id.replace('-', '_')}"
             
-            # Drop table if exists
+            # Drop table if exists (fast operation)
             cursor.execute(f"IF OBJECT_ID('{table_name}', 'U') IS NOT NULL DROP TABLE {table_name}")
             
-            # Create table structure based on dataframe
+            # Create table structure with optimized column types
             create_sql = f"CREATE TABLE {table_name} (\n"
             create_sql += "    row_id BIGINT IDENTITY(1,1) PRIMARY KEY,\n"
             create_sql += "    template_id BIGINT,\n"
             create_sql += "    session_id NVARCHAR(50),\n"
             
-            # Add columns for each dataframe column
             for col in dataframe.columns:
-                create_sql += f"    [{col}] NVARCHAR(MAX),\n"
+                create_sql += f"    [{col}] NVARCHAR(4000),\n"  # Reduced from MAX to 4000 for better performance
             
             create_sql = create_sql.rstrip(',\n') + "\n)"
             cursor.execute(create_sql)
             
-            # Prepare bulk insert
+            self.logger.info(f"ULTRA-FAST INSERT: Starting bulk insert for {len(dataframe)} rows...")
+            
+            # METHOD 1: Try ultra-optimized pandas to_sql (fastest when it works)
+            success = self._try_ultra_fast_pandas_insert(table_name, dataframe, template_id, session_id)
+            
+            if not success:
+                # METHOD 2: Ultra-fast pyodbc with maximum optimization
+                self._ultra_fast_pyodbc_insert(cursor, conn, table_name, dataframe, template_id, session_id)
+            
+            cursor.close()
+            
+            elapsed_time = time.time() - start_time
+            self.logger.info(f"ULTRA-FAST INSERT COMPLETED: {len(dataframe)} rows in {elapsed_time:.2f} seconds ({len(dataframe)/elapsed_time:.0f} rows/sec)")
+            
+        except Exception as e:
+            self.logger.error(f"Error in ultra-fast bulk insert: {str(e)}")
+            raise
+    
+    def _try_ultra_fast_pandas_insert(self, table_name, dataframe, template_id, session_id):
+        """Try pandas to_sql with maximum optimization"""
+        try:
+            # Only use pandas method if SQLAlchemy is available and configured properly
+            try:
+                from sqlalchemy import create_engine
+                from urllib.parse import quote_plus
+                
+                # Prepare dataframe with metadata columns
+                df_with_meta = dataframe.copy()
+                df_with_meta.insert(0, 'template_id', template_id)
+                df_with_meta.insert(1, 'session_id', session_id)
+                
+                # Create ultra-optimized connection string with compatible format
+                server_no_port = config.FABRIC_SERVER.split(',')[0]
+                
+                # Use simpler connection string for better compatibility
+                connection_string = (
+                    f"mssql+pyodbc://?odbc_connect="
+                    f"DRIVER={{ODBC Driver 18 for SQL Server}};"
+                    f"SERVER={server_no_port};"
+                    f"DATABASE={config.FABRIC_DATABASE};"
+                    f"UID={config.AZURE_CLIENT_ID};"
+                    f"PWD={config.AZURE_CLIENT_SECRET};"
+                    f"Authentication=ActiveDirectoryServicePrincipal;"
+                    f"Encrypt=yes;"
+                    f"TrustServerCertificate=no;"
+                    f"fast_executemany=True"
+                )
+                
+                # Create engine with compatible settings
+                engine = create_engine(
+                    connection_string,
+                    pool_pre_ping=False,
+                    pool_recycle=-1,
+                    echo=False
+                )
+                
+                # Use pandas to_sql with maximum performance settings
+                df_with_meta.to_sql(
+                    name=table_name,
+                    con=engine,
+                    if_exists='append',
+                    index=False,
+                    method='multi',  # Multi-row INSERT statements
+                    chunksize=10000  # Optimized chunk size
+                )
+                
+                engine.dispose()
+                self.logger.info(f"ULTRA-FAST: Successfully bulk inserted {len(dataframe)} rows using pandas to_sql")
+                return True
+                
+            except ImportError as ie:
+                self.logger.info(f"SQLAlchemy not available: {ie}")
+                return False
+                
+        except Exception as e:
+            self.logger.warning(f"Pandas ultra-fast insert failed: {e}")
+            self.logger.info("Falling back to ultra-fast pyodbc method...")
+            return False
+    
+    def _ultra_fast_pyodbc_insert(self, cursor, conn, table_name, dataframe, template_id, session_id):
+        """Ultra-fast pyodbc insert with optimized batch sizing for large datasets"""
+        try:
+            # Prepare optimized bulk insert
             columns_list = "template_id, session_id, " + ", ".join([f"[{col}]" for col in dataframe.columns])
             placeholders = ", ".join(["?"] * (len(dataframe.columns) + 2))
             insert_sql = f"INSERT INTO {table_name} ({columns_list}) VALUES ({placeholders})"
             
-            # Insert data in batches
-            batch_size = 1000
-            for i in range(0, len(dataframe), batch_size):
+            # ULTRA OPTIMIZATION: Enable fast_executemany
+            cursor.fast_executemany = True
+            
+            # Smart batch sizing based on dataset size
+            total_rows = len(dataframe)
+            if total_rows <= 1000:
+                # Small files: single batch
+                batch_size = total_rows
+                conn.autocommit = True
+            elif total_rows <= 10000:
+                # Medium files: 2-5 batches
+                batch_size = 5000
+                conn.autocommit = False
+            else:
+                # Large files: optimized smaller batches to avoid timeouts
+                batch_size = 5000
+                conn.autocommit = False
+            
+            self.logger.info(f"Processing {total_rows} rows in batches of {batch_size}")
+            
+            total_batches = (total_rows + batch_size - 1) // batch_size
+            
+            for i in range(0, total_rows, batch_size):
                 batch = dataframe.iloc[i:i+batch_size]
                 batch_data = []
                 
                 for _, row in batch.iterrows():
-                    row_data = [template_id, session_id] + [str(val) if pd.notna(val) else None for val in row.values]
+                    row_data = [template_id, session_id] + [
+                        str(val)[:4000] if pd.notna(val) and val is not None else None 
+                        for val in row.values
+                    ]
                     batch_data.append(tuple(row_data))
                 
-                cursor.executemany(insert_sql, batch_data)
-                conn.commit()
-                
-                self.logger.info(f"Inserted batch {i//batch_size + 1}: {len(batch)} rows")
+                # Execute batch insert with timeout protection
+                try:
+                    cursor.executemany(insert_sql, batch_data)
+                    if not conn.autocommit:
+                        conn.commit()
+                    
+                    batch_num = (i // batch_size) + 1
+                    self.logger.info(f"ULTRA-FAST batch {batch_num}/{total_batches}: {len(batch_data)} rows inserted")
+                    
+                except Exception as batch_error:
+                    self.logger.error(f"Batch {batch_num} failed: {batch_error}")
+                    if not conn.autocommit:
+                        conn.rollback()
+                    raise
             
-            cursor.close()
-            self.logger.info(f"Successfully bulk inserted {len(dataframe)} rows into SQL Fabric table {table_name}")
+            # Reset autocommit if changed
+            if conn.autocommit:
+                conn.autocommit = False
+            
+            self.logger.info(f"ULTRA-FAST: Successfully bulk inserted {total_rows} rows using optimized pyodbc with {total_batches} batches")
             
         except Exception as e:
-            self.logger.error(f"Error in bulk insert: {str(e)}")
+            # Reset autocommit on error
+            try:
+                if conn.autocommit:
+                    conn.autocommit = False
+            except:
+                pass
+            self.logger.error(f"Error in ultra-fast pyodbc insert: {str(e)}")
             raise
     
     def get_file_data(self, session_id: str, template_id: int, columns: list = None) -> list:
@@ -397,6 +524,46 @@ class FabricSQLService:
                             })
                             total_errors += 1
                     
+                    elif rule == 'Float':
+                        # Check for invalid float values
+                        cursor.execute(f"""
+                            SELECT row_id, [{column_name}] 
+                            FROM {table_name} 
+                            WHERE template_id = ? AND [{column_name}] IS NOT NULL 
+                            AND LTRIM(RTRIM([{column_name}])) != ''
+                            AND ISNUMERIC([{column_name}]) = 0
+                        """, (template_id,))
+                        
+                        for row_id, value in cursor.fetchall():
+                            errors.append({
+                                'row': row_id,
+                                'column': column_name,
+                                'value': value,
+                                'rule_failed': 'Float',
+                                'reason': 'Value is not a valid number'
+                            })
+                            total_errors += 1
+                    
+                    elif rule == 'Text':
+                        # NEW: Text rule validation - flag numeric values as errors
+                        cursor.execute(f"""
+                            SELECT row_id, [{column_name}] 
+                            FROM {table_name} 
+                            WHERE template_id = ? AND [{column_name}] IS NOT NULL 
+                            AND LTRIM(RTRIM([{column_name}])) != ''
+                            AND ISNUMERIC([{column_name}]) = 1
+                        """, (template_id,))
+                        
+                        for row_id, value in cursor.fetchall():
+                            errors.append({
+                                'row': row_id,
+                                'column': column_name,
+                                'value': value,
+                                'rule_failed': 'Text',
+                                'reason': 'Value should be text, not numeric'
+                            })
+                            total_errors += 1
+                    
                     elif rule == 'Email':
                         # Check for invalid email format
                         cursor.execute(f"""
@@ -414,6 +581,46 @@ class FabricSQLService:
                                 'value': value,
                                 'rule_failed': 'Email',
                                 'reason': 'Invalid email format'
+                            })
+                            total_errors += 1
+                    
+                    elif rule == 'Boolean':
+                        # Check for invalid boolean values
+                        cursor.execute(f"""
+                            SELECT row_id, [{column_name}] 
+                            FROM {table_name} 
+                            WHERE template_id = ? AND [{column_name}] IS NOT NULL
+                            AND LTRIM(RTRIM([{column_name}])) != ''
+                            AND UPPER(LTRIM(RTRIM([{column_name}]))) NOT IN ('TRUE', 'FALSE', '1', '0', 'YES', 'NO')
+                        """, (template_id,))
+                        
+                        for row_id, value in cursor.fetchall():
+                            errors.append({
+                                'row': row_id,
+                                'column': column_name,
+                                'value': value,
+                                'rule_failed': 'Boolean',
+                                'reason': 'Value must be true/false, 1/0, or yes/no'
+                            })
+                            total_errors += 1
+                    
+                    elif rule == 'Alphanumeric':
+                        # Check for non-alphanumeric values (contains special characters)
+                        cursor.execute(f"""
+                            SELECT row_id, [{column_name}] 
+                            FROM {table_name} 
+                            WHERE template_id = ? AND [{column_name}] IS NOT NULL
+                            AND LTRIM(RTRIM([{column_name}])) != ''
+                            AND [{column_name}] LIKE '%[^a-zA-Z0-9 ]%'
+                        """, (template_id,))
+                        
+                        for row_id, value in cursor.fetchall():
+                            errors.append({
+                                'row': row_id,
+                                'column': column_name,
+                                'value': value,
+                                'rule_failed': 'Alphanumeric',
+                                'reason': 'Value should contain only letters, numbers and spaces'
                             })
                             total_errors += 1
             
@@ -439,12 +646,34 @@ class FabricSQLService:
             self.logger.error(f"Error in SQL Fabric validation: {str(e)}")
             raise
     
-    def apply_corrections_in_sql_fabric(self, session_id: str, template_id: int, corrections: dict) -> int:
-        """Apply corrections to data in SQL Fabric"""
+    def apply_corrections_in_sql_fabric(self, corrections: dict, session_id: str, template_id: int) -> int:
+        """Apply corrections to data in SQL Fabric - WITH DEBUG LOGGING"""
         try:
             table_name = f"file_data_{session_id.replace('-', '_')}"
             conn = self.get_connection()
             cursor = conn.cursor()
+            
+            # ===== DEBUG SECTION =====
+            # DEBUG: Log what corrections we received from frontend
+            self.logger.info(f"[DEBUG] === CORRECTION DEBUG SESSION START ===")
+            self.logger.info(f"[DEBUG] Received {len(corrections)} corrections from frontend:")
+            for key, value in corrections.items():
+                self.logger.info(f"[DEBUG] Frontend sent: '{key}' → '{value}'")
+            
+            # DEBUG: Show current table structure and data
+            self.logger.info(f"[DEBUG] Examining table: {table_name}")
+            cursor.execute(f"SELECT TOP 10 * FROM {table_name} WHERE template_id = ? ORDER BY row_id", (template_id,))
+            all_rows = cursor.fetchall()
+            if all_rows:
+                columns = [desc[0] for desc in cursor.description]
+                self.logger.info(f"[DEBUG] Table columns: {columns}")
+                self.logger.info(f"[DEBUG] Current table data:")
+                for row in all_rows:
+                    row_dict = dict(zip(columns, row))
+                    self.logger.info(f"[DEBUG]   {row_dict}")
+            else:
+                self.logger.error(f"[DEBUG] ERROR: No rows found in table {table_name}!")
+            # ===== END DEBUG SECTION =====
             
             corrected_count = 0
             
@@ -454,14 +683,66 @@ class FabricSQLService:
                 if len(parts) == 2:
                     row_id, column_name = parts[0], parts[1]
                     
-                    # Update the value in SQL Fabric
-                    cursor.execute(f"""
-                        UPDATE {table_name} 
-                        SET [{column_name}] = ?
-                        WHERE template_id = ? AND row_id = ?
-                    """, (new_value, template_id, row_id))
+                    # ===== DEBUG FOR EACH CORRECTION =====
+                    self.logger.info(f"[DEBUG] --- Processing correction ---")
+                    self.logger.info(f"[DEBUG] Original key: '{correction_key}'")
+                    self.logger.info(f"[DEBUG] Parsed row_id: '{row_id}'")
+                    self.logger.info(f"[DEBUG] Parsed column_name: '{column_name}'")
+                    self.logger.info(f"[DEBUG] New value: '{new_value}'")
                     
-                    corrected_count += 1
+                    # Check if this exact row and column exists
+                    try:
+                        cursor.execute(f"SELECT [{column_name}] FROM {table_name} WHERE template_id = ? AND row_id = ?", 
+                                     (template_id, row_id))
+                        existing_row = cursor.fetchone()
+                        
+                        if existing_row:
+                            old_value = existing_row[0]
+                            self.logger.info(f"[DEBUG] Found target: row_id={row_id}, column='{column_name}', current_value='{old_value}'")
+                            
+                            # Update the value
+                            cursor.execute(f"""
+                                UPDATE {table_name} 
+                                SET [{column_name}] = ?
+                                WHERE template_id = ? AND row_id = ?
+                            """, (new_value, template_id, row_id))
+                            
+                            rows_affected = cursor.rowcount
+                            self.logger.info(f"[DEBUG] Update result: {rows_affected} rows affected")
+                            
+                            if rows_affected > 0:
+                                corrected_count += 1
+                                self.logger.info(f"[DEBUG] SUCCESS: Updated row_id={row_id}, column='{column_name}': '{old_value}' → '{new_value}'")
+                            else:
+                                self.logger.error(f"[DEBUG] FAILED: Update command executed but 0 rows affected!")
+                        else:
+                            self.logger.error(f"[DEBUG] ERROR: No row found with row_id={row_id} for column '{column_name}'")
+                            # Show what rows DO exist for this column
+                            cursor.execute(f"SELECT row_id, [{column_name}] FROM {table_name} WHERE template_id = ? ORDER BY row_id", (template_id,))
+                            available_rows = cursor.fetchall()
+                            self.logger.info(f"[DEBUG] Available rows for column '{column_name}': {available_rows}")
+                            
+                    except Exception as col_error:
+                        self.logger.error(f"[DEBUG] ERROR accessing column '{column_name}': {col_error}")
+                    # ===== END DEBUG FOR EACH CORRECTION =====
+                else:
+                    self.logger.error(f"[DEBUG] ERROR: Invalid correction key format: '{correction_key}'")
+            
+            # ===== FINAL DEBUG SUMMARY =====
+            self.logger.info(f"[DEBUG] === CORRECTION SUMMARY ===")
+            self.logger.info(f"[DEBUG] Total corrections attempted: {len(corrections)}")
+            self.logger.info(f"[DEBUG] Successful corrections: {corrected_count}")
+            self.logger.info(f"[DEBUG] Failed corrections: {len(corrections) - corrected_count}")
+            
+            # Show final table state
+            self.logger.info(f"[DEBUG] Final table state:")
+            cursor.execute(f"SELECT TOP 10 * FROM {table_name} WHERE template_id = ? ORDER BY row_id", (template_id,))
+            final_rows = cursor.fetchall()
+            for row in final_rows:
+                row_dict = dict(zip(columns, row))
+                self.logger.info(f"[DEBUG]   {row_dict}")
+            self.logger.info(f"[DEBUG] === CORRECTION DEBUG SESSION END ===")
+            # ===== END FINAL DEBUG =====
             
             conn.commit()
             cursor.close()
@@ -471,10 +752,12 @@ class FabricSQLService:
             
         except Exception as e:
             self.logger.error(f"Error applying corrections in SQL Fabric: {str(e)}")
+            if 'conn' in locals():
+                conn.rollback()
             raise
     
     def export_corrected_data(self, session_id: str, template_id: int, columns: list) -> pd.DataFrame:
-        """Export corrected data from SQL Fabric as DataFrame"""
+        """Export corrected data from SQL Fabric as DataFrame - FIXED VERSION"""
         try:
             table_name = f"file_data_{session_id.replace('-', '_')}"
             columns_sql = ", ".join([f"[{col}]" for col in columns])
@@ -482,9 +765,26 @@ class FabricSQLService:
             query = f"SELECT {columns_sql} FROM {table_name} WHERE template_id = ? ORDER BY row_id"
             
             conn = self.get_connection()
-            df = pd.read_sql(query, conn, params=[template_id])
+            cursor = conn.cursor()
+            cursor.execute(query, (template_id,))
             
-            self.logger.info(f"Exported {len(df)} rows from SQL Fabric")
+            # Get column names from cursor description
+            column_names = [desc[0] for desc in cursor.description]
+            
+            # Fetch all rows
+            rows = cursor.fetchall()
+            cursor.close()
+            
+            # Convert to DataFrame manually instead of using pd.read_sql
+            data_dict = {col: [] for col in column_names}
+            
+            for row in rows:
+                for i, value in enumerate(row):
+                    data_dict[column_names[i]].append(value)
+            
+            df = pd.DataFrame(data_dict)
+            
+            self.logger.info(f"Exported {len(df)} rows from SQL Fabric (FIXED METHOD)")
             return df
             
         except Exception as e:
@@ -717,6 +1017,57 @@ class FabricSQLService:
             return results
         except Exception as e:
             self.logger.error(f"Error getting validation history: {str(e)}")
+            raise
+    
+
+    
+    def create_default_rules(self):
+        """Create default validation rules in SQL Fabric"""
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            
+            # Check if validation_rule_types table has any rules
+            cursor.execute("SELECT COUNT(*) FROM validation_rule_types WHERE rule_name IN ('Required', 'Int', 'Float', 'Text', 'Email', 'Date', 'Boolean', 'Alphanumeric')")
+            existing_count = cursor.fetchone()[0]
+            
+            if existing_count == 0:
+                # Insert default validation rules
+                default_rules = [
+                    (1, 'Required', 'Ensures the field is not null', '{"allow_null": false}', 1, 0),
+                    (2, 'Int', 'Validates integer format', '{"format": "integer"}', 1, 0),
+                    (3, 'Float', 'Validates number format (integer or decimal)', '{"format": "float"}', 1, 0),
+                    (4, 'Text', 'Allows text with quotes and parentheses', '{"allow_special": false}', 1, 0),
+                    (5, 'Email', 'Validates email format', '{"regex": "^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\\.[a-zA-Z0-9-.]+$"}', 1, 0),
+                    (6, 'Date', 'Validates date format', '{"format": "%d-%m-%Y"}', 1, 0),
+                    (7, 'Boolean', 'Validates boolean format (true/false or 0/1)', '{"format": "boolean"}', 1, 0),
+                    (8, 'Alphanumeric', 'Validates alphanumeric format', '{"format": "alphanumeric"}', 1, 0)
+                ]
+                
+                for rule in default_rules:
+                    cursor.execute("""
+                        INSERT INTO validation_rule_types (rule_type_id, rule_name, description, parameters, is_active, is_custom)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    """, rule)
+                
+                conn.commit()
+                self.logger.info("Default validation rules created successfully")
+            else:
+                self.logger.info(f"Default validation rules already exist ({existing_count} found)")
+            
+            # DEBUG: Show what's actually in the database
+            cursor.execute("SELECT rule_type_id, rule_name FROM validation_rule_types ORDER BY rule_type_id")
+            existing_rules = cursor.fetchall()
+            self.logger.info(f"DEBUGGING - Current validation rules in DB:")
+            for rule in existing_rules:
+                self.logger.info(f"  ID: {rule[0]}, Name: {rule[1]}")
+            
+            cursor.close()
+            
+        except Exception as e:
+            self.logger.error(f"Error creating default validation rules: {str(e)}")
+            if 'conn' in locals():
+                conn.rollback()
             raise
     
     def close_connection(self):

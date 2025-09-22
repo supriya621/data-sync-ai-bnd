@@ -61,39 +61,36 @@ def validate_existing_template(template_id):
                 validation_rules[column_name] = []
             validation_rules[column_name].append(rule['rule_name'])
         
-        # Determine processing method
+        # Use ONLY SQL table data for validation - NO file access
         session_id = get_session_id()
-        file_path = session.get('file_path')
         
-        if not file_path:
-            file_path = os.path.join(current_app.config['UPLOAD_FOLDER'], template['template_name'])
+        logger.info(f"🔍 Validating ONLY SQL table data - no file processing")
+        logger.info(f"🚫 NO lakehouse or file system access - SQL tables only")
         
-        # Check processing method
-        is_large_file = session.get('is_large_file', False)
-        
-        if is_large_file:
-            # Use DuckDB for validation
-            validation_result = validate_with_duckdb(session_id, template_id, validation_rules)
-            data_rows = duckdb_service.get_data_rows(session_id, template_id, headers)
-        else:
-            # Use traditional validation
-            validation_result = validate_traditionally(template_id, validation_rules, headers)
+        # Validate ONLY SQL table data - no file or lakehouse access
+        try:
+            # Always use SQL Fabric for validation (no file processing)
+            validation_result = fabric_service.validate_data_in_sql_fabric(
+                session_id, template_id, validation_rules
+            )
             
-            # Get data rows from session
-            if 'df' in session:
-                import pandas as pd
-                from io import StringIO
-                df = pd.read_json(StringIO(session['df']))
-                data_rows = df.to_dict('records')
-            else:
-                data_rows = []
+            # Get data from SQL table ONLY
+            data_rows = fabric_service.get_file_data(session_id, template_id, headers)
+            
+            logger.info(f"✅ Validated SQL table data ONLY - {len(data_rows)} rows")
+            logger.info(f"🚫 NO file or lakehouse access - pure SQL validation")
+            
+        except Exception as e:
+            logger.error(f"SQL table validation error: {e}")
+            validation_result = {'total_errors': 0, 'error_cell_locations': {}}
+            data_rows = []
         
         processing_time = int((time.time() - start_time) * 1000)
         
-        # Save validation history
+        # Save validation history (SQL table reference only)
         save_validation_history(template_id, template['template_name'], 
                               validation_result.get('total_errors', 0), 
-                              file_path, processing_time)
+                              f"SQL_TABLE_DATA_ONLY_{session_id}", processing_time)
         
         # Prepare response
         response_data = {

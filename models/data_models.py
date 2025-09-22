@@ -215,6 +215,61 @@ class SessionData:
             'has_existing_rules': self.has_existing_rules
         }
 
+@dataclass
+class ConfigurationHistory:
+    """Rule Configuration History model"""
+    history_id: int
+    user_id: int
+    template_id: int
+    file_name: str
+    original_file_name: str
+    sheet_name: Optional[str]
+    total_rules_configured: int
+    configured_columns_count: int
+    configuration_summary: Optional[str]  # JSON string
+    file_size_mb: Optional[float]
+    total_rows: Optional[int]
+    created_at: Optional[datetime]
+    updated_at: Optional[datetime]
+    is_active: bool = True
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'history_id': self.history_id,
+            'user_id': self.user_id,
+            'template_id': self.template_id,
+            'file_name': self.file_name,
+            'original_file_name': self.original_file_name,
+            'sheet_name': self.sheet_name,
+            'total_rules_configured': self.total_rules_configured,
+            'configured_columns_count': self.configured_columns_count,
+            'configuration_summary': self.configuration_summary,
+            'file_size_mb': self.file_size_mb,
+            'total_rows': self.total_rows,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+            'is_active': self.is_active
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'ConfigurationHistory':
+        return cls(
+            history_id=data.get('history_id'),
+            user_id=data.get('user_id'),
+            template_id=data.get('template_id'),
+            file_name=data.get('file_name'),
+            original_file_name=data.get('original_file_name'),
+            sheet_name=data.get('sheet_name'),
+            total_rules_configured=data.get('total_rules_configured', 0),
+            configured_columns_count=data.get('configured_columns_count', 0),
+            configuration_summary=data.get('configuration_summary'),
+            file_size_mb=data.get('file_size_mb'),
+            total_rows=data.get('total_rows'),
+            created_at=datetime.fromisoformat(data['created_at']) if data.get('created_at') else None,
+            updated_at=datetime.fromisoformat(data['updated_at']) if data.get('updated_at') else None,
+            is_active=data.get('is_active', True)
+        )
+
 class APIResponse:
     """Standard API response format"""
     

@@ -48,27 +48,29 @@ def upload_file():
         if len(filename) > MAX_FILENAME_LENGTH:
             raise ValidationError('Filename too long')
         
-        # Save file
-        file_path = os.path.join(current_app.config['UPLOAD_FOLDER'], filename)
+        # Save file TEMPORARILY for processing only (NOT in lakehouse)
+        temp_file_path = os.path.join(current_app.config['UPLOAD_FOLDER'], f"temp_{filename}")
         start_time = time.time()
         
         try:
-            file.save(file_path)
-            logger.info(f"File saved: {filename}")
+            file.save(temp_file_path)
+            logger.info(f"File saved TEMPORARILY for processing: {filename}")
+            logger.info(f"🚫 NO lakehouse storage - temp file only for data extraction")
         except Exception as e:
-            raise FileProcessingError(f'Failed to save file: {str(e)}', filename)
+            raise FileProcessingError(f'Failed to save temp file: {str(e)}', filename)
         
-        # Process file with optimization
+        # Process file IN MEMORY (no lakehouse storage)
         try:
-            sheets, is_large_file_processing = read_file_optimized(file_path)
+            sheets, is_large_file_processing = read_file_optimized(temp_file_path)
             processing_time = int((time.time() - start_time) * 1000)
             
-            logger.info(f"File processed in {processing_time}ms using {'DuckDB' if is_large_file_processing else 'traditional'} method")
+            logger.info(f"File processed IN MEMORY in {processing_time}ms - SQL table data ONLY")
+            logger.info(f"🚫 NO lakehouse file storage - memory processing only")
             
         except Exception as e:
-            # Clean up saved file on processing error
+            # Clean up temp file on processing error
             try:
-                os.remove(file_path)
+                os.remove(temp_file_path)
             except:
                 pass
             raise FileProcessingError(f'Failed to process file: {str(e)}', filename)
@@ -98,9 +100,29 @@ def upload_file():
         if template_id is None:
             template_id = create_new_template(filename, headers, sheet_name)
         
-        # Store session data
+        # Store ONLY table data in SQL Fabric - NO files in lakehouse
+        try:
+            if not is_large_file_processing:
+                data_df = sheets[sheet_name].iloc[header_row + 1:].reset_index(drop=True)
+                data_df.columns = headers
+                
+                # Store ONLY table data in SQL Fabric
+                fabric_service.bulk_insert_file_data(data_df, get_session_id(), template_id)
+                logger.info(f"✅ STORED TABLE DATA ONLY in SQL Fabric - {len(data_df)} rows")
+                logger.info(f"🚫 NO files stored in lakehouse - only processed data")
+        except Exception as e:
+            logger.error(f"Error storing table data in SQL Fabric: {e}")
+        
+        # IMMEDIATELY delete temp file - no persistent file storage
+        try:
+            os.remove(temp_file_path)
+            logger.info(f"✅ DELETED temp file: {temp_file_path}")
+            logger.info(f"🎯 RESULT: Only table data in SQL Fabric, NO files anywhere")
+        except Exception as e:
+            logger.warning(f"Could not delete temp file: {e}")
+        
+        # Store session data (NO file paths - only metadata)
         session_data = {
-            'file_path': file_path,
             'template_id': template_id,
             'header_row': header_row,
             'headers': headers,
@@ -108,7 +130,10 @@ def upload_file():
             'current_step': 3 if has_existing_rules else 1,
             'has_existing_rules': has_existing_rules,
             'is_large_file': is_large_file_processing,
-            'processing_time': processing_time
+            'processing_time': processing_time,
+            'storage_type': 'SQL_TABLE_ONLY',  # Indicator
+            'file_stored': False,  # Explicit flag
+            'lakehouse_storage': False  # Explicit flag
         }
         
         for key, value in session_data.items():

@@ -18,9 +18,16 @@ bcrypt==4.0.1
 # Microsoft Fabric / Azure Integration
 pyodbc==4.0.39
 azure-identity==1.15.0
+SQLAlchemy==1.4.53  # Compatible version for pandas to_sql
+urllib3==1.26.18    # Required for SQLAlchemy connection encoding
 
 # DuckDB for Large File Processing  
 duckdb==0.9.1
+
+# Redis Caching Layer - PERFORMANCE UPGRADE
+redis==5.0.1
+redis[hiredis]==5.0.1  # High-performance Redis client
+Flask-Caching==2.1.0   # Flask caching extension
 
 # Logging and Utilities
 logging==0.4.9.6

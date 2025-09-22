@@ -346,22 +346,31 @@ def upload_file():
         if file.filename == '':
             return jsonify({'success': False, 'message': 'No file selected'}), 400
         
-        # Save file temporarily
-        filename = f"{session['user_id']}_{uuid.uuid4()}_{file.filename}"
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        file.save(filepath)
+        # Save file TEMPORARILY for data extraction ONLY (NO lakehouse storage)
+        temp_filename = f"temp_{session['user_id']}_{uuid.uuid4()}_{file.filename}"
+        temp_filepath = os.path.join(app.config['UPLOAD_FOLDER'], temp_filename)
+        file.save(temp_filepath)
+        logger.info(f"🚫 TEMP file only - NO lakehouse storage: {temp_filename}")
         
-        # Read file to get info and load into SQL Fabric
-        if filepath.endswith('.csv'):
-            df = pd.read_csv(filepath)
-        elif filepath.endswith(('.xlsx', '.xls')):
-            df = pd.read_excel(filepath)
+        # Read file IN MEMORY and extract data for SQL Fabric ONLY
+        if temp_filepath.endswith('.csv'):
+            df = pd.read_csv(temp_filepath)
+        elif temp_filepath.endswith(('.xlsx', '.xls')):
+            df = pd.read_excel(temp_filepath)
         else:
             return jsonify({'success': False, 'message': 'Unsupported file format'}), 400
         
-        # Create template in SQL Fabric
+        # IMMEDIATELY delete temp file - NO persistent storage
+        try:
+            os.remove(temp_filepath)
+            logger.info(f"✅ DELETED temp file: {temp_filename}")
+            logger.info(f"🎯 RESULT: Only table data in SQL Fabric, NO files stored")
+        except Exception as e:
+            logger.warning(f"Could not delete temp file: {e}")
+        
+        # Create template in SQL Fabric (table reference ONLY)
         template_data = {
-            'template_name': filename,
+            'template_name': temp_filename.replace('temp_', ''),
             'user_id': session['user_id'],
             'sheet_name': 'Sheet1',
             'headers': json.dumps(df.columns.tolist()),
@@ -374,15 +383,17 @@ def upload_file():
         session_id = get_session_id()
         fabric_service.bulk_insert_file_data(df, session_id, template_id)
         
-        # Store in session
+        # Store in session (NO file paths - only table data references)
         session['current_file'] = {
-            'filename': filename,
-            'filepath': filepath,
+            'filename': temp_filename.replace('temp_', ''),
             'headers': df.columns.tolist(),
             'row_count': len(df),
             'preview': df.head(5).to_dict('records'),
             'template_id': template_id,
-            'processing_engine': 'SQL Fabric'
+            'processing_engine': 'SQL Fabric',
+            'storage_type': 'SQL_TABLE_ONLY',
+            'file_stored': False,
+            'lakehouse_storage': False
         }
         
         session['current_template_id'] = template_id
